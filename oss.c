@@ -253,7 +253,7 @@ void createChild(){
                 char buf[BUF_LEN];
                 sprintf(buf, "%d\n", pTableID);
                 printf("current concurrent process %d: myPID: %ld localPID: %s\n", currentConcurrentProcesses, (long) childPid, buf);
-                execl("./user", "user", buf, NULL);
+                execl("./user_proc", "user_proc", buf, NULL);
             }
 
             /* parent process */

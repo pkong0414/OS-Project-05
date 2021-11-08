@@ -1,5 +1,5 @@
 #!bin/bash
-# this is the Makefile for Project3
+# this is the Makefile for Project5
 
 CC = gcc
 CFLAGS = -Wall -g -lm
@@ -12,9 +12,9 @@ OSS_SRC = oss.c
 OSS_OBJ	= $(OSS_SRC:.c=.o) $(SHARED_OBJ) $(SIGNAL_OBJ) $(QUEUE_OBJ)
 OSS = oss
 
-USER_SRC = user.c
+USER_SRC = user_proc.c
 USER_OBJ = $(USER_SRC:.c=.o) $(SHARED_OBJ) $(SIGNAL_OBJ)
-USER = user
+USER = user_proc
 
 TARGETS = $(OSS) $(USER)
 
