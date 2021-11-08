@@ -1,4 +1,4 @@
-# OS-Project-04
+# OS-Project-05
 An OS Resource Simulator
 
 Usage: %s [-h] [-t <seconds. DEFAULT:3 MAX:100>] [-l < logName >.log ]
