@@ -39,20 +39,19 @@ void exitOSS();
 void ossSimulation();
 void assignPid2PTable(int index, pid_t pid);
 void handleRunningProcess();
-void handleBlockedProcess();
-void handleTerminateProcess();
-void handleExpiredProcess();
-void handleUnblock();
-void queueProcess();
-void scheduleProcess();
+void handleRequest( PCB* pcb );
+void handleTerminate( PCB* pcb );
+void handleRelease( PCB* pcb );
+void bankersAlgo();
+void printSystemResources();
+void printAllocatedResources();
 void passTime();
-void makeActiveProcess( PCB *pcb);
 void writeLog( const char* logmsg );
 
 //Queues
-Queue *highQueue;
-Queue *lowQueue;
+Queue *safeQueue;
 Queue *blockedQueue;
+Queue *messageQueue;
 
 // GLOBALS
 enum state{idle, want_in, in_cs};
@@ -71,15 +70,16 @@ struct sembuf semS;
 Message message;
 PCB *activePCB = NULL;
 Bitfield availPids[18];
-int allowedProcesses = MAX_TOTAL_PROC;              //Number we will use to define total allowed processes [default: 50]
+int allowedProcesses = 50;                           //Number we will use to define total allowed processes [default: 50]
 long maxTimeBetweenNewProcsNS = 100;                //we'll use this nanosecs to determine when oss creates a new process
 long maxTimeBetweenNewProcsSecs = 1;                //we'll use this seconds determine when oss creates a new process
 
 //log globals
+int grantedCount = 0;
 int totalLines = 0;                                 //this will keep track of lines written. Limit is 10000
-FILE *saveFile;
-char *logName;
-
+char *logName = "log.log";
+bool verbose = false;                               //if this is turned on, our log will report everything
+                                                    //else we'll only report certain operations.
 
 //OSS timers
 Time spawnTime = {.sec = 0,.ns = 0};
@@ -110,75 +110,35 @@ int main(int argc, char**argv) {
         return 1;
     }
 
-    shm = getSharedMemory();                    //getting shared memory
-
     ossSimulation();
 
     exitOSS();
 }
 
 void parsingArgs(int argc, char** argv){
-    if( argc < 2 ){
+    if( argc < 1 ){
         printf("Usage: %s [-h] [-t <seconds. DEFAULT:3 MAX:100>] [-l <logName>.log ]\n", argv[0]);
         printf("This program is a license manager, part 2. We'll be doing using this to learn about semaphores\n");
         exit(EXIT_FAILURE);
     }
 
-    while((opt = getopt(argc, argv, "ht:l")) != -1) {
-        switch (opt) {
-            case 'h':
-                //This is the help parameter. We'll be printing out what this program does and will end the program.
-                //If this is entered along with others, we'll ignore the rest of the other parameters to print help
-                //and end the program accordingly.
-                printf("Usage: %s [-h] [-t <seconds. DEFAULT:3 MAX:100>] [-l <logName>.log ]\n", argv[0]);
-                printf("This program is a license manager, part 2. We'll be doing using this to learn about semaphores\n");
-                exit(EXIT_SUCCESS);
-            case 't':
-                if (!isdigit(argv[2][0])) {
-                    //This case the user uses -t parameter but entered a string instead of an int.
-                    printf("value entered: %s\n", argv[2]);
-                    printf("%s: ERROR: -t <number of seconds before timing out>\n", argv[0]);
-                    exit(EXIT_FAILURE);
-                } else {
-                    // -t gives us the number of seconds to our timer.
-                    tValue = atoi(optarg);
-                    // we will check to make sure nValue is 1 to 20.
-                    if (tValue < 1) {
-                        printf("%s: processes cannot be less than 1. Resetting to default value: 3\n", argv[0]);
-                        tValue = MAX_SECONDS;
-                    } else if (tValue > 100) {
-                        printf("%s: max time allowed is 100. Setting tValue to 100.\n", argv[0]);
-                    }
-                    printf("tValue: %d\n", tValue);
-                    break;
-                }
-            case 'l':
-                printf("%s\n", argv[4] );
-                if (!isalpha(argv[4][0])) {
-                    //this case the user uses -l parameter but entered a non alphabet.
-                    logName = "logfile.log";
-                    printf("invalid input. Changing logfile to: %s\n", logName);
-                    break;
-                } else {
-                    logName = argv[4];
-                    sprintf(logName, "%s.log", logName);
-                }
-                printf("logName: %s\n", logName);
-                break;
-            default: /* '?' */
-                printf("%s: ERROR: parameter not recognized.\n", argv[0]);
-                fprintf(stderr, "Usage: %s [-h] [-t <seconds. DEFAULT:100>] [-l <log name>]\n", argv[0]);
-                exit(EXIT_FAILURE);
-        }
-    } /* END OF GETOPT */
+//    while((opt = getopt(argc, argv, "")) != -1) {
+//        switch (opt) {
+//            default: /* '?' */
+//                printf("%s: ERROR: parameter not recognized.\n", argv[0]);
+//                fprintf(stderr, "Usage: %s [-h] [-t <seconds. DEFAULT:100>] [-l <log name>]\n", argv[0]);
+//                exit(EXIT_FAILURE);
+//        }
+//    }
+
+
+    /* END OF GETOPT */
 }
 
 void printOSSInfo(){
     printBitfield();
-    printf("printing highQueue:\n");
-    printQueue( highQueue );
-    printf("printing lowQueue:\n");
-    printQueue( lowQueue );
+    printf("printing safeQueue:\n");
+    printQueue( safeQueue );
     printf("printing blockedQueue:\n");
     printQueue( blockedQueue );
 
@@ -233,8 +193,8 @@ void createChild(){
     int pTableID;
     int priorityRandom;
     if( !pidFull() ) {
-        pTableID = getAvailPid();
-        if (currentConcurrentProcesses <= MAX_PROC) {
+        if (currentConcurrentProcesses <= MAX_PROC && (totalProcessesCreated < allowedProcesses)) {
+            pTableID = getAvailPid();
             if ((pid = fork()) == -1) {
                 perror("Failed to create grandchild process\n");
                 if (removeShm() == -1) {
@@ -273,24 +233,9 @@ void createChild(){
             newPCB = getPTablePCB(pTableID);
             printf("oss: newPCB's pid: %ld\n", (long) newPCB->userPID);
             initPClock(newPCB);
+            push( messageQueue, pTableID);                  //pushing a new process to message queue.
+            // we don't need to get process priority, for this one. So let's just send a message to tell them to run.
 
-            if((priorityRandom = (rand() % 100) + 1) > IOCHANCE ) {
-                //this process is IO bound
-                newPCB->priority = 0;
-                totalHighPriorityProc++;
-                push( highQueue, pTableID );
-                sprintf(logmsg, "oss: new I/O process created at: %ld:%ld\n", shm->sysTime.sec, shm->sysTime.ns);
-                //writeLog( logmsg );
-                return;
-            } else {
-                //this process is CPU bound
-                newPCB->priority = 1;
-                totalLowPriorityProc++;
-                push( lowQueue, pTableID );
-                sprintf(logmsg, "oss: new CPU process created at: %ld:%ld\n", shm->sysTime.sec, shm->sysTime.ns);
-                //writeLog( logmsg );
-                return;
-            }
         }
         return;
     }
@@ -304,44 +249,55 @@ void initOSS(){
     initPid();
     //initializing Queues
     //Queues
-    highQueue = initQueue();
-    lowQueue = initQueue();
+    safeQueue = initQueue();
     blockedQueue = initQueue();
+    messageQueue = initQueue();
     srand(time(NULL));
-    saveFile = fopen(logName, "w+");
 
-    if(saveFile == NULL){
-        perror("oss: ERROR");
-        //return -1 if unsuccessful
-        return;
+    shm = getSharedMemory();                    //getting shared memory
+
+    //giving us available resources.
+    int i;
+    for( i = 0; i < REC_MAX; i++ ){
+        shm->available[i] = (rand() % 10 ) + 1;                 //this will give us avail resources 1 - 10 inclusive.
+    }
+    //randomly deciding which resource will be shared resource
+    //We assume shared resources is anything from 20 +- 5(this will be decided random)
+    //calculating sharedCount
+    int sharedCount = (rand() % (25 - (25 - 15 )) + 15);
+    int resource;
+    for( i = 0; i < sharedCount; i++){
+        while(true){
+            resource = rand() % REC_MAX;                        //getting the random resource we'll be marking shared.
+            if(!shm->shared[resource]){
+                shm->shared[resource] = true;
+                break;
+            }
+        }
+    }
+
+    for( i = 0; i < MAX_PROC; i++){
+        shm->pTable[i].localPID = -1;
+        shm->pTable[i].userPID = -1;
     }
 }
 
 void initPClock( PCB *pcb ){
-    clearTime( &pcb->burstTime);
-    clearTime( &pcb->totalCpuTime);
-    clearTime( &pcb->waitTime);
-    clearTime( &pcb->totalWait);
     clearTime( &pcb->totalSysTime);
-    clearTime( &pcb->timeLimit);
-    copyTime( &shm->sysTime, &pcb->arriveTime );
+    clearTime( &pcb->totalCpuTime);
+//    clearTime( &pcb->burstTime);
+//    clearTime( &pcb->waitTime);
+//    clearTime( &pcb->totalWait);
+//    clearTime( &pcb->timeLimit);
+//    copyTime( &shm->sysTime, &pcb->arriveTime );
 }
 
 void exitOSS(){
     //removing shared memory and message queues
     removeShm();
     removeMsq();
-    removeQueue( highQueue );
-    removeQueue( lowQueue );
+    removeQueue( safeQueue );
     removeQueue( blockedQueue );
-    if (fclose(saveFile) == -1) {
-        perror("oss: ERROR");
-
-        //exiting since file is unable to be closed
-        exit(EXIT_FAILURE);
-    } else {
-        printf("file closed\n");
-    }
     exit(EXIT_SUCCESS);
 }
 
@@ -350,25 +306,18 @@ void ossSimulation(){
 //    printBitfield();
 //    printQueue( highQueue );
 //    printQueue( lowQueue );
-//    printQueue( blockedQueue );
-//    printQueue( expiredQueue );
 //    exitOSS();
 
     while(1) {
-        if(!activePCB){
-            passTime();
-        }
-        while (currentConcurrentProcesses < 19 && !(totalProcessesCreated >= allowedProcesses)) {
-            //we are adding time in our while loop.
-            if( pidFull() )
-                break;                          //we don't have any available pid slots
+        passTime();
+        while ((currentConcurrentProcesses < MAX_PROC) || (totalProcessesCreated < allowedProcesses)) {
+            if( pidFull() ) {
+                break;
+            }                          //we don't have any available pid slots
             //we want to increment the time until it is actually time to create processes
             //we are following the format of 1.xx,
             // where 1 second is guaranteed
             // xx depends on nanoseconds rolled from 1-1000
-            if(!activePCB){
-                passTime();
-            }
 
             printf( "oss: system Time: %ld:%ld\n", shm->sysTime.sec, shm->sysTime.ns );
             if( (spawnTime.sec <= shm->sysTime.sec ) &&
@@ -378,36 +327,32 @@ void ossSimulation(){
                 addTime( &spawnTime, (long)( ((rand() % maxTimeBetweenNewProcsSecs) + 1) * SECOND) );
                 addTime( &spawnTime, (long)( ((rand() % maxTimeBetweenNewProcsNS) + 1)) );
                 createChild();
+                break;
 //                printOSSInfo();
+            } else {
+                passTime();
             }
+
         }
-
+        int status;
         handleRunningProcess();
-        handleUnblock();
-        scheduleProcess();
 
-        pid_t pid = waitpid(-1, &waitStatus, WNOHANG);
+        pid_t pid = waitpid(-1, &status, WNOHANG);
         if (pid > 0){
             //we are waiting for our processes to end
-            if (WIFEXITED(waitStatus)) {
-                currentConcurrentProcesses--;
 
-                printf("current concurrent process %d\n", currentConcurrentProcesses);
-                printf("Child process successfully exited with status: %d\n", waitStatus);
-                printf("total processes created: %d\n", totalProcessesCreated);
-                //*********************************** EXIT SECTION **********************************************
+            int localpid = WEXITSTATUS(status);
+            currentConcurrentProcesses--;
+            totalExitedProcess++;
+            printf("current concurrent process %d\n", currentConcurrentProcesses);
+            printf("Child process successfully exited with status: %d\n", localpid);
+            printf("total processes created: %d\n", totalProcessesCreated);
+            //*********************************** EXIT SECTION **********************************************
 
-                //we want to clear process tables and perform calculations to make the report
-                removePidFromIndex( waitStatus );
-                clearAProcessTable( waitStatus );
-
+            //we want to clear process tables and perform calculations to make the report
 
 
-                //******************************** REMAINDER SECTION ********************************************
-
-                //we finished the report and now we want to look for a new process to be active, else we'll need to make
-                //a new one
-            }
+            //******************************** REMAINDER SECTION ********************************************
         }
         if(totalExitedProcess == allowedProcesses){
             //we'll break out of our loop when we are at created process limit
@@ -422,317 +367,346 @@ void ossSimulation(){
 }
 
 void assignPid2PTable( int index, pid_t pid){
-    if( shm->pTable[index].userPID == 0 )
         shm->pTable[index].userPID = pid;
 }
 
 void handleRunningProcess(){
-    //receiving a message from blocked processes
-    if( activePCB ) {
-        PCB *pcb = activePCB;
-        printf("inside the scheduler, looking for... %ld\n", (long) pcb->userPID);
-        if (receiveMsg(&message, (long) pcb->userPID, getPMsgID(), true) == -1) {
+    // receiving a message from processes. This will be unlike project 4 where we have the benefit of one process
+    // Since we'll be receiving request from multiple processes.
+    // We also do not have any single active process, so we must look for the process itself.
+    // By having a messageQueue, we'll be telling processes to move along.
+
+    //we'll be storing localpids inside of messageQueue, we'll use that to grab the PCB in our PTable.
+    int currentLocalPid;
+    int i;
+
+    printQueue(messageQueue);
+
+    for(i = 0; i < messageQueue->size; i++) {
+        // we only got 18 processes, and we'll rotate through the queue receive messages
+        // when we hit the end of the queue we'll be doing other things.
+        if( messageQueue->arr[i] == -1 )
+            continue;                                       //skipping if we find the queue slot empty.
+
+        currentLocalPid = messageQueue->arr[i];
+        PCB *pcb = getPTablePCB( currentLocalPid );
+        printf("inside the resource manager, looking for... %ld\n", pcb->userPID);
+        //we'll be telling the processes to go first before we process their stuff.
+        sendMsg( &message, "START", pcb->userPID, getCMsgID(), true );
+
+        if (receiveMsg(&message, pcb->userPID, getPMsgID(), true) == -1) {
             printf("oss: did not receive a message\n");
         } else {
-            //message sent!
+            //message received!
             printf("message received!\n");
-            if (strcmp(message.msg, "BLOCK") == 0) {
-                printf("oss: BLOCK msg received from %ld\n", message.type);
-                handleBlockedProcess( pcb );
-            }
-            else if (strcmp(message.msg, "TERMINATE") == 0) {
+            if (strcmp(message.msg, "TERMINATE") == 0) {
                 printf("oss: TERMINATE msg received from %ld\n", message.type);
-                handleTerminateProcess( pcb );
+                handleTerminate(pcb);
+            } else if (strcmp(message.msg, "REQUEST") == 0) {
+                printf("oss: REQUEST msg received from %ld\n", message.type);
+                handleRequest(pcb);
+            } else if (strcmp(message.msg, "RELEASE") == 0) {
+                printf("oss: RELEASE msg received from %ld\n", message.type);
+                handleRelease(pcb);
             }
-            else if (strcmp(message.msg, "EXPIRED") == 0) {
-                printf("oss: EXPIRED msg received from %ld\n", message.type);
-                handleExpiredProcess( pcb );
-            }
+            bankersAlgo();
         }
     }
+    passTime();
 }
 
-void handleBlockedProcess( PCB* pcb ){
-    char logmsg[BUF_LEN];
-    int quantumPercent;
-    long quantumUsed;
-    Time *usedTime;
-    //we'll be looking to see how much time has the user process used
-    if (receiveMsg(&message, (long)pcb->userPID, getPMsgID(), true) == -1) {
-        printf("oss: did not receive a message\n");
-    } else {
-        totalBlockedProcess++;
-        quantumPercent = atoi(message.msg);
-        printf("%d\n", quantumPercent);
-
-        //we are going to modify this
-        quantumUsed = (pcb->timeLimit.ns * (quantumPercent/100));
-        addTime( &shm->sysTime, quantumUsed );
-        addTime( &pcb->totalCpuTime, quantumUsed );
-        addTime( &usedTime, quantumUsed );
-        addTime( &pcb->totalSysTime, quantumUsed);
-        copyTime( &usedTime, &pcb->burstTime );
-        //we do not want to queue it into a normal queue, so we'll just push it directly to a blocked queue.
-        sprintf(logmsg, "oss: process %ld blocked at: %ld:%ld\n", pcb->userPID, shm->sysTime.sec, shm->sysTime.ns);
-        writeLog( logmsg );
-        push( blockedQueue, pcb->localPID);
-    }
-    activePCB = NULL;
-    if( !activePCB ){
-        printf("active Process is blocked\n");
-    }
-}
-
-void handleTerminateProcess( PCB* pcb ){
-    //we'll be looking to see how many percent of the time quantum user process used before termination
-    char logmsg[BUF_LEN];
-    int quantumPercent;
-    long quantumUsed;
-    if (receiveMsg(&message, (long) pcb->userPID, getPMsgID(), true) == -1) {
-        printf("oss: did not receive a message\n");
-    } else {
-        //we got our quantum used percent
-        totalExitedProcess++;
-        printf("oss: received termination from process: %ld\n", (long)pcb->userPID);
-        quantumPercent = atoi(message.msg);
-        printf("%d\n",quantumPercent);
-
-        quantumUsed = ( pcb->timeLimit.ns ) * (quantumPercent/100);
-        //advancing our system time with the quantumUsed
-        addTime( &shm->sysTime, quantumUsed );
-        //adding the quantumUsed to totalCpuTime
-        addTime( &pcb->totalCpuTime, quantumUsed);
-        //now we apply the finishing touches to the process since it is exiting
-        //we want to note the time of exit on the user process.
-        copyTime( &shm->sysTime, &pcb->exitTime );
-        removePidFromIndex(pcb->localPID);
-        sprintf(logmsg, "oss: process %ld exited at: %ld:%ld\n", pcb->userPID, shm->sysTime.sec, shm->sysTime.ns);
-        writeLog( logmsg );
-    }
-    activePCB = NULL;
-}
-
-void handleExpiredProcess( PCB* pcb ){
-    //While we may not necessarily need details about quantum used we still need to apply it to the system clock!
-    char logmsg[BUF_LEN];
-    long quantumUsed = pcb->timeLimit.ns;                        //grabbing the full timeslice.
-
-    //adding quantum used into oss's system time
-    addTime(&shm->sysTime, quantumUsed);
-    //adding quantum used to user process's totalCpuTime and totalSysTime.
-    addTime(&pcb->totalCpuTime, quantumUsed);
-
-    //timestamp from current system time copied to waitTime
-    copyTime( &shm->sysTime, &pcb->queuedTime);                   //timestamp for when the process is put into queue
-    //we'll queue the activeProcess now.
-
-    sprintf(logmsg, "oss: process %ld expired at: %ld:%ld\n", pcb->userPID, shm->sysTime.sec, shm->sysTime.ns);
-    writeLog( logmsg );
-    queueProcess( pcb );
-    activePCB = NULL;
-}
-
-void handleUnblock(){
-    char logmsg[BUF_LEN];
-    PCB *tempPCB;
-    int tempLocalPID;
+void handleRequest( PCB* pcb ){
+    //we know how much is being requested by the specific pcb, so we'll use that to make the according allocation.
     int i;
-    printf("printing blockedQueue:\n");
-    printQueue(blockedQueue);
-    if( !isQueueEmpty(blockedQueue) ) {
-        if( !activePCB ){
-            printf("inside unblock handler. There isn't an active process. Passing time\n");
-            addTime(&shm->sysTime, 5 * SECOND);
-            addTime(&idleTime, 5 * SECOND);
+    int tempList[REC_MAX];
+    char msg[BUF_LEN];
+    bool resourceAvail = true;
+    printSystemResources();
+    for( i = 0; i < REC_MAX; i++ ){
+        if( shm->shared[i] ){
+            //since we know this is a shared resources, we don't have to worry about availability.
+            continue;
         }
-        for (i = 0; i < blockedQueue->currentCapacity; i++) {
-            int j = (blockedQueue->front + i) % blockedQueue->size;
-            tempLocalPID = pop(blockedQueue);      //assigned the local pid so we can pop it
-            tempPCB = getPTablePCB(tempLocalPID);         //getting our PCB so we can do the operations we need
-            if (receiveMsg(&message, tempPCB->userPID, getPMsgID(), false) == -1) {
-                printf("oss: did not receive an unblocked message. Moving on...\n");
-                //since we didn't get an unblocked message we put the PCB back into blocked queue
-                push(blockedQueue, tempLocalPID);
-            } else if (strcmp(message.msg, "UNBLOCK") == 0) {
-                printf("./oss unblock received from %ld\n", (long) tempPCB->userPID);
-                //we've received the blocked process unblocking itself.
-                //We want to put the process into a regular queue
-                //messaging the oss to unblock them.
-                //we'll be using a popIndex.
-                //we'll be poping the blockedQueue based on the local pid.
+        if( pcb->requests[i] <= shm->available[i] ){
+            //this means we have enough available to handle this
+            tempList[i] = pcb->requests[i];
+        } else {
+            resourceAvail = false;
+        }
+    }
 
-                //we want to copy the exact time it is going to get queued into our system.
-                printf("tempPCB priority: %d\n", tempPCB->priority );
-                sprintf(logmsg, "oss: process %ld unblocked at: %ld:%ld\n", tempPCB->userPID, shm->sysTime.sec, shm->sysTime.ns);
-                writeLog( logmsg );
-                copyTime(&shm->sysTime, &tempPCB->queuedTime);
-                if (tempPCB->priority == 0) {
-                    push(highQueue, tempLocalPID);
-                } else if (tempPCB->priority == 1){
-                    push(lowQueue, tempLocalPID);
+    if( resourceAvail ){
+        // if memory is available!
+        int j;
+        for( j = 0; j < REC_MAX; j++){
+            pcb->allocate[j] += tempList[j];
+            shm->available[j] -= tempList[j];
+            pcb->requests[j] = 0;
+            if(tempList[j] == 0)
+                continue;                               //we are going to skip this if there isn't any requests made.
+
+            if(!verbose){
+                // with verbose off we only indicate what resources are requested granted and avail resources
+                sprintf( msg, "Process:%d Granted R%d:%d\n", pcb->localPID, j, tempList[j]);
+                writeLog( msg );
+            } else {
+                // with verbose on we'll log what resources are released
+                sprintf( msg, "Process:%d Granted R%d:%d\n", pcb->localPID, j, tempList[j]);
+                writeLog( msg );
+            }
+        }
+        //resource granted.
+        printf("./oss: Resource Granted. Sending message to process: %ld\n", pcb->userPID);
+        grantedCount++;
+        sendMsg( &message, "GRANTED", pcb->userPID, getCMsgID(), true );
+    } else {
+        // if memory isn't immediately available.
+        printf("./oss: we don't have enough resources. User:%ld is blocked for now.\n", pcb->userPID);
+        sprintf( msg, "Process:%d Denied resources and blocked for now\n", pcb->localPID);
+        writeLog( msg );
+        push(blockedQueue, pcb->localPID);
+    }
+    if(grantedCount == 20){
+        printAllocatedResources();
+        grantedCount = 0;                               //we are resetting the granted count.
+    }
+
+}
+
+void handleTerminate( PCB* pcb ){
+    int i;
+    char msg[BUF_LEN];
+    int localPid = pcb->localPID;
+    //we have a terminated process. This pcb will release its memory before printing out its stats.
+    handleRelease( pcb );
+    sprintf( msg, "Process:%d terminated at %ld:%ld\n", pcb->localPID, shm->sysTime.sec, shm->sysTime.ns);
+    writeLog( msg );
+    clearTime( &pcb->totalCpuTime);
+
+    for(i = 0; i < REC_MAX; i++){
+        pcb->requests[i] = 0;
+        pcb->reqMax[i] = 0;
+    }
+    //we'll need to pop this process from the messageQueue tables.
+    for(i = 0; i < MAX_PROC; i++){
+        if( messageQueue->arr[i] == localPid ){
+            //we've found our localPid in this messageQueue
+            messageQueue->arr[i] = -1;
+        }
+    }
+
+    removePidFromIndex( localPid );
+    clearAProcessTable( localPid );
+
+
+}
+
+void handleRelease( PCB* pcb ){
+    //A Process is releasing its resources
+    int i;
+    int tempVal;
+    char msg[BUF_LEN];
+    for( i = 0; i < REC_MAX; i++ ){
+        if(shm->shared[i] == true){
+            pcb->allocate[i] = 0;
+            continue;
+        } else {
+            shm->available[i] += pcb->allocate[i];
+            tempVal = pcb->allocate[i];
+            pcb->allocate[i] = 0;
+        }
+        if(!verbose){
+            // with verbose off we only indicate what resources are requested granted and avail resources
+            printf("Process:%d Released R%d:%d\n", pcb->localPID, i, tempVal);
+            sprintf( msg, "Process:%d Released R%d:%d\n", pcb->localPID, i, tempVal);
+            writeLog( msg );
+        } else {
+            // with verbose on we'll log what resources are released
+            printf("Process:%d Released R%d:%d\n", pcb->localPID, i, tempVal);
+            sprintf( msg, "Process:%d Released R%d:%d\n", pcb->localPID, i, tempVal);
+            writeLog( msg );
+        }
+    }
+}
+
+void bankersAlgo(){
+    // We'll be performing a deadlock check using banker's algo now.
+
+    // When verbose is off, it should only log when a deadlock is detected, and how it was resolved.
+    // This means it is the only function not affected by verbose
+    int i,j,k;
+    int p = 0;
+
+    bool safe;
+    bool found;
+    char msg[BUF_LEN];
+    int safeStates[blockedQueue->currentCapacity];
+    int localPid[blockedQueue->currentCapacity];
+    // this is what we'll use to calculate our safety.
+    int potential[blockedQueue->currentCapacity][REC_MAX];                          //potential requests
+    int copyAlloc[blockedQueue->currentCapacity][REC_MAX];
+    int copyReq[blockedQueue->currentCapacity][REC_MAX];
+    int copyAvail[REC_MAX];
+    int totalPotentialReq;
+
+    if( blockedQueue->currentCapacity == 0 ){
+        return;
+    }
+
+    for( i = 0; i < REC_MAX; i++ ) {
+        copyAvail[i] = shm->available[i];
+    }
+
+    for( i = 0; i < blockedQueue->currentCapacity; i++ ){
+        // we'll be looking at our blockedQueue to handle deadlock
+
+        // idea is if the potential requests of all the processes exceed the available resources
+        // available, we'll be deadlocked!
+
+        //we'll grab the first pid.
+        localPid[p] = findFrontPID( blockedQueue );
+
+        for( j = 0; j < REC_MAX; j++ ) {
+            copyAlloc[i][j] = shm->pTable[localPid[p]].allocate[j];
+            copyReq[i][j] = shm->pTable[localPid[p]].requests[j];
+
+            //we'll calculate our potential requests by taking max - allocate. This will be for all resources
+            //for all processes.
+            potential[i][j] = shm->pTable[localPid[p]].reqMax[j] - shm->pTable[localPid[p]].allocate[j];
+        }
+        //incrementing process index
+        p++;
+        //this will rotate the queue all around.
+        rotateQueue( blockedQueue );
+    }
+
+    // we've completed our copy; so now we'll find our safety sequence. Since we are handling processes by fulfilling
+    // requests and immediately taking the resources from the processes finished, we'll be able to further allocate to
+    // others.
+
+    //resetting process count to 0
+    p = 0;
+    for( i = 0; i < blockedQueue->currentCapacity; i++ ) {
+        safe = false;
+        found = false;
+        if( !found ){
+            for( j = 0; j < REC_MAX; j++){
+                if( potential[i][j] > copyAvail[j] ) {
+                    sprintf( msg, "Deadlock Detected at %d:%d\n", shm->sysTime.sec, shm->sysTime.ns);
+                    writeLog( msg );
+                    break;
+                    // if any potential requests of all processes exceed the available units and thus all processes are
+                    // deadlocked. This means we can skip this one and look for another thing.
                 }
-                if (!activePCB){
-                    scheduleProcess();
+            }
+
+            if( j == REC_MAX ){
+                // this means we've made it to the end of the checklist on avail units vs potential request, thus safe.
+                for( k = 0; k < REC_MAX; k++ ){
+                    copyAvail[k] += copyAlloc[i][k];
                 }
+
+                //pushing to the safe Queue
+                push( safeQueue, localPid[i] );
+                while( localPid[i] != blockedQueue->arr[blockedQueue->front])
+                    rotateQueue(blockedQueue);
+                pop(blockedQueue);
+                found = true;
+                safe = true;
             }
         }
     }
-}
 
-void queueProcess( PCB *pcb ){
-    //we'll make a queue process here
-    //two cases activePCB is either priority 0 or 1
-    if( pcb->priority == 0 ){
-        //priority is 0
-        printf("pushing localPID: %d into highQueue\n", pcb->localPID);
-        push( highQueue, pcb->localPID );
-        printf("printing highQueue:\n");
-        printQueue( highQueue );
-        copyTime( &shm->sysTime, &pcb->queuedTime );
-    } else {
-        //priority is 1
-        printf("pushing localPID: %d into lowQueue\n", pcb->localPID);
-        push( lowQueue, pcb->localPID );
-        printf("printing lowQueue:\n");
-        printQueue( lowQueue );
-        copyTime( &shm->sysTime, &pcb->queuedTime );
-    }
-}
+    if( safe ) {
+        sprintf(msg, "Safe sequence found!\n");
+        writeLog(msg);
 
-void scheduleProcess(){
-    if( activePCB ){
-        printf("There is currently an active Process\n");
+        int currentLPid;
+        PCB *pcb;
+        for (i = 0; i < safeQueue->currentCapacity; i++) {
+            // we have a safe sequence, so we'll be popping in the order it was meant. The last sequence will also release.
+            currentLPid = pop(safeQueue);
+            pcb = getPTablePCB(currentLPid);
+            sprintf(msg, "Granting Process:%d after banker's algo\n", pcb->userPID);
+            writeLog(msg);
+            sendMsg(&message, "GRANTED", pcb->userPID, getCMsgID(), true);
+        }
+        removeQueue(safeQueue);
         return;
     }
 
-    char logmsg[BUF_LEN];
-    Time queuedWait1;                                       //time waiting in queue by this high priority process
-    Time queuedWait2;                                       //time waiting in queue by this low priority process
-
-    int highlocalpid;
-    int lowlocalpid;
-    int activeLocalPID;
-    PCB *pcb1 = NULL;
-    PCB *pcb2 = NULL;
-
-    if( isQueueEmpty(highQueue) && isQueueEmpty(lowQueue) ){
-        printf("both priority queues are empty currently\n");
+    if( !safe ){
+        //we'll remove the safeQueue since we know we haven't found anything.
+        removeQueue(safeQueue);
+        // we know there isn't a safe way to handle this.
         return;
     }
+}
 
-    if( !isQueueEmpty(highQueue) ) {
-        highlocalpid = findFrontPID(highQueue);
-        printf("found highlocalpid: %d\n", highlocalpid);
-        pcb1 = getPTablePCB(highlocalpid);
-        printf("got process: %ld\n", (long) pcb1->userPID);
-        queuedWait1.sec = shm->sysTime.sec - pcb1->queuedTime.sec;
-        queuedWait1.ns = shm->sysTime.ns - pcb1->queuedTime.ns;
-        if( isQueueEmpty( lowQueue ) ){
-            //popping high queue since low queue is empty.
-            printf("popping high queue\n");
-            activeLocalPID = pop( highQueue );
-            printf("process table index: %d grabbed\n", activeLocalPID);
-            activePCB = pcb1;
-            printf("loading process %ld to be activeProcess\n", (long)activePCB->userPID);
-            addTime( &activePCB->totalWait, queuedWait1.sec * SECOND );
-            addTime( &activePCB->totalWait, queuedWait1.ns);
-            makeActiveProcess( activePCB );
-            return;
+void printSystemResources(){
+    int i, j;
+    for( i = 0; i < REC_MAX; i++ ){
+        //printing out the top row of resources
+        printf(" R%*d", 1, i);
+    }
+    printf("\n");
+    for( j = 0; j < REC_MAX; j++){
+        //printing the resources now
+        if( j < 10) {
+            printf("%*d", 3, shm->available[j]);
+        } else {
+            printf(" %*d", 3, shm->available[j]);
         }
     }
+    printf( "\n");
+}
 
-    if( !isQueueEmpty(lowQueue) ) {
-        lowlocalpid = findFrontPID(lowQueue);
-        printf("found lowlocalpid: %d\n", lowlocalpid);
-        pcb2 = getPTablePCB(lowlocalpid);
-        printf("got process: %ld\n", (long) pcb2->userPID);
-        queuedWait2.sec = shm->sysTime.sec - pcb2->queuedTime.sec;
-        queuedWait2.ns = shm->sysTime.ns - pcb2->queuedTime.ns;
-        if ( isQueueEmpty( highQueue ) ){
-            //popping low queue since high queue is empty.
-            printf("popping low queue\n");
-            activeLocalPID = pop( lowQueue );
-            printf("process table index: %d grabbed\n", activeLocalPID);
-            activePCB = pcb2;
-            printf("loading process %ld to be activeProcess\n", (long)activePCB->userPID);
-            addTime( &activePCB->totalWait, queuedWait2.sec * SECOND );
-            addTime( &activePCB->totalWait, queuedWait2.ns);
-            makeActiveProcess( activePCB );
-            return;
+void printAllocatedResources(){
+    int i, j;
+    char msg[BUF_LEN];
+
+    for( i = 0; i < REC_MAX; i++ ){
+        //printing out the top row of resources
+        printf("     R%d", i);
+    }
+    printf("\n");
+//    sprintf( msg, "\n");
+//    writeLog( msg );
+    for( i = 0; i < MAX_PROC; i++) {
+        //starting the printing of processes
+        printf("P%*d", 4, i );
+//        sprintf( msg, "P%*d", 4, i );
+//        writeLog( msg );
+        for( j = 0; j < REC_MAX; j++){
+            //printing the resources now
+            if( j < 10 ) {
+                printf(msg, "%*d", 3, shm->pTable[i].allocate[j]);
+//                sprintf(msg, "%*d", 3, shm->pTable[i].allocate[j]);
+//                writeLog(msg);
+            } else {
+                printf(" %*d", 3, shm->pTable[i].allocate[j]);
+//                sprintf(msg, " %*d", 3, shm->pTable[i].allocate[j]);
+//                writeLog(msg);
+            }
         }
+        printf("\n");
+//        sprintf( msg, "\n");
+//        writeLog(msg);
     }
-
-
-    //we will run a check on the next processes from each queue (high and low)
-    //scheduler doesn't prioritize on priority alone. We also consider other things:
-    // 1. age of the process
-    // 2. the time the process has been waiting for since last CPU burst.
-
-    // we'll get the age of the process by the time it has been in the system.
-
-    // we'll get the time waiting by taking current system time and subtracting from the time stamp of the last burst.
-    // basically: ( shm->sysTime - pcb->queuedTime )
-
-    // normally we do give priority to high priority queue.
-    // However, we do want consider cases where a low priority process has waited too long.
-
-    // if both the age of the process is older AND the waiting time is greater than higher priority, then
-    // we shall give low priority process the opportunity.
-
-    //we've got both queues and will make the comparisons to give us an activePCB from a queue
-    if( queuedWait2.sec > queuedWait1.sec ) {
-        // a whole second is a big difference, we shall give low Queue a priority this case.
-        activeLocalPID = pop( lowQueue );
-        activePCB = getPTablePCB( activeLocalPID );
-        addTime( &activePCB->totalWait, queuedWait2.sec * SECOND );
-        addTime( &activePCB->totalWait, queuedWait2.ns);
-    } else if ( pcb2->totalSysTime.sec > pcb1->totalSysTime.sec ){
-        // we'll take age to consideration. Again 1 second is a big difference, so we shall give low Queue
-        // priority again.
-        activeLocalPID = pop( lowQueue );
-        activePCB = pcb2;
-        addTime( &activePCB->totalWait, queuedWait2.sec * SECOND );
-        addTime( &activePCB->totalWait, queuedWait2.ns);
-    } else if ( queuedWait2.ns > QUANTUM * 3 ) {
-        // we'll consider giving lower queue the priority if its wait time in nano seconds is greater than
-        // 3 timeslices.
-        activeLocalPID = pop( lowQueue );
-        activePCB = pcb2;
-        addTime( &activePCB->totalWait, queuedWait2.sec * SECOND );
-        addTime( &activePCB->totalWait, queuedWait2.ns);
-    } else {
-        activeLocalPID = pop( highQueue );
-        activePCB = pcb1;
-        addTime( &activePCB->totalWait, queuedWait1.sec * SECOND );
-        addTime( &activePCB->totalWait, queuedWait1.ns);
-    }
-    makeActiveProcess( activePCB );
 }
 
 void passTime(){
     long timePassed;
+    int i;
+    PCB *pcb;
     timePassed = ( SECOND + ((rand() % 1000 ) + 1) );
     addTime( &shm->sysTime, timePassed );
-    if( !activePCB ){
-        addTime( &idleTime, timePassed );
-    }
-}
-
-void makeActiveProcess( PCB *pcb ){
-    char logmsg[BUF_LEN];
-    clearTime( &pcb->timeLimit );
-    if( pcb->priority == 1 ) {
-        addTime(&pcb->timeLimit, QUANTUM * 2);
-    } else {
-        addTime(&pcb->timeLimit, QUANTUM);
-    }
-    sprintf(logmsg, "oss: process %ld dispatched at: %ld:%ld\n", pcb->userPID, shm->sysTime.sec, shm->sysTime.ns);
-    writeLog( logmsg );
-    if (sendMsg(&message, "START", pcb->userPID, getCMsgID(), false) == -1) {
-        printf("./oss: did not send a message\n");
-    } else {
-        //message sent!
-        printf("./oss %ld: START msg sent to %ld\n", (long) getpid(), (long) pcb->userPID);
+    for(i = 0; i < messageQueue->currentCapacity; i++ ){
+        if(messageQueue->arr[i] == -1){
+            continue;
+        }
+        pcb = getPTablePCB( messageQueue->arr[i] );
+        addTime( &pcb->totalSysTime, timePassed );
     }
 }
 
@@ -740,13 +714,26 @@ void writeLog(const char* logmsg) {
     /* logmsg in the format:
     *   Time PID Iteration# of NumberOfIterations
     */
+    FILE *saveFile = fopen(logName, "a+");
+
+
     //The writeLog will write the logmsg to the .log file
-    if (totalLines <= 10000) {
-        //Now writing to file
-        fprintf(saveFile, "%s\n", logmsg);
-        //closing file
-//        printf("File saved to: %s\n", logName);
-        //return 0 if successful
+    if(saveFile == NULL){
+        perror("log.c: ERROR");
+        //return -1 if unsuccessful
         return;
+    }
+    else {
+        if (totalLines < 10000) {
+            //Now writing to file
+            fprintf(saveFile, "%s", logmsg);
+            //closing file
+            fclose(saveFile);
+            return;
+        } else {
+            printf("./oss: ERROR: OVER 10000 lines. Message not saved.\n");
+            fclose(saveFile);
+            return;
+        }
     }
 }

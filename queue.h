@@ -21,5 +21,6 @@ void removeQueue( Queue *queue );
 int isQueueEmpty( Queue *queue  );
 void printQueue( Queue *queue  );
 int findFrontPID( Queue *queue );
+int rotateQueue(Queue *queue);
 
 #endif

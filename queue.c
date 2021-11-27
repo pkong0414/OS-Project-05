@@ -30,7 +30,7 @@ int push( Queue* queue, int localPID ){
         return -1;
     } else {
         queue->arr[ queue->rear ] = localPID;
-        queue->rear = (queue->rear + 1) % 18;
+        queue->rear = (queue->rear + 1) % queue->size;
         queue->currentCapacity++;
         return 0;
     }
@@ -54,20 +54,38 @@ int pop( Queue *queue ){
 }
 
 void removeQueue( Queue *queue){
-    free(queue);
+    int i;
+    for(i = 0; i < queue->size; i++){
+        queue->arr[i] = -1;
+    }
+    queue->currentCapacity = 0;
+    queue->front = 0;
+    queue->rear = 0;
 }
 
 int isQueueEmpty( Queue* queue ){
-    return queue->currentCapacity == 0;
+    int i;
+    for( i = 0; i < queue->size; i++ ){
+        if( queue->arr[i] > -1 )
+            return false;
+    }
+    return true;
 }
 
 void printQueue( Queue* queue ) {
     int i;
-    if( queue->currentCapacity == 0 )
-        printf("Queue is empty.\n");
-    for (i = 0; i < queue->currentCapacity; i++) {
-        int j = (queue->front + i) % queue->size;
-        printf("%d\n", queue->arr[j]);
+    int j;
+//    if( isQueueEmpty(queue) ){
+//        printf("there is no queue\n");
+//        return;
+//    }
+
+    for ( i = 0; i < queue->size; i++) {
+        j = (queue->front + i) % queue->size;
+        if( queue->arr[j] == -1 ){
+            continue;
+        }
+        printf("index %d: %d\n", j, (unsigned int)queue->arr[j]);
     }
 }
 
@@ -78,4 +96,17 @@ int findFrontPID( Queue *queue ){
     } else {
         return queue->arr[queue->front];
     }
+}
+
+int rotateQueue(Queue *queue){
+    //we'll use this to rotate around the queue to handle blocked queue and pop the ones handled.
+
+    // currentCapacity will allow us to wrap around the queue based on the size of the queue vs where's the front.
+    // This do while ensures that we will be rotating the queue in the right way. If there's a -1 we know that it is
+    // an empty slot
+    do{
+        queue->front = (queue->front+1) % queue->size;
+        queue->rear = (queue->rear+1) % queue->size;
+    }while( queue->arr[queue->front] == -1);
+    return queue->front;
 }

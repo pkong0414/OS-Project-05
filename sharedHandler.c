@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
@@ -93,9 +94,8 @@ PCB *getPTablePID( pid_t pid ){
 
 void clearAProcessTable( int index ){
     PCB *pcb = &shmaddr->pTable[index];
-    pcb->userPID = 0;
+    pcb->userPID = -1;
     pcb->localPID = -1;
-    pcb->priority = -1;
 }
 
 int removeShm(){
@@ -195,7 +195,7 @@ int receiveMsg(Message *message, pid_t pid, int msgid, bool waiting){
         //received message!
         return 0;
     } else {
-        perror("receive Message.");
+        perror("receive Message");
         return -1;
     }
 }
@@ -207,7 +207,7 @@ int sendMsg(Message *message, char *msg, pid_t pid, int msgid, bool waiting){
         //sent message!
         printf("user %ld: message sent.\n", (long)pid);
     } else {
-        perror("send Message.");
+        perror("send Message");
         return -1;
     }
 }
@@ -263,9 +263,4 @@ int compareLeftGtrEqTime( Time time1, Time time2 ){
         //failed all the cases so we know that time2 is simply bigger.
         return 0;
     }
-}
-
-void calcPSysTime( PCB *pcb, Time sysTime ){
-    pcb->totalSysTime.ns = ( sysTime.ns - pcb->arriveTime.ns );
-    pcb->totalSysTime.sec = ( sysTime.sec - pcb->arriveTime.sec );
 }
